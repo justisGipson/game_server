@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 // add id and discrete id position
 pub struct Entity {
-  pub id: i32,
+  pub id: u32,
   pub pos: (i32, i32),
 }
 
