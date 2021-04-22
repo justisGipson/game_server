@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 use websocket::message::OwnedMessage;
 use websocket::server::InvalidConnection;
 use websocket::server::r#async::Server;
+use websocket::result::WebSocketError;
 
 use futures::{Future,Stream,Sink};
-use futures::future::{self, Loop};
+// use futures::future::{self, Loop};
 
 use std::sync::{Arc,RwLock};
 
@@ -53,6 +54,17 @@ fn main() {
             let accept = upgrade.accept().and_then(move |(framed,_)| {
                 let (sink, stream) = framed.split();
 
+                // Put a shareable (multiple-producer) channel ontop of the sink
+                let (tx, rx) = futures::sync::mpsc::channel(100);
+                let f = rx
+                    .map_err(|_| WebSocketError::ResponseError("rx dropped"))
+                    .forward(sink)
+                    .map(|_| ())
+                    .map_err(|_| ());
+                let sink = tx;
+
+                executor_2inner.spawn(f);
+
                 { // Increment the counter by first locking the RwLock
                     let mut c = counter_inner.write().unwrap();
                     *c += 1;
@@ -65,10 +77,18 @@ fn main() {
                 let c = *counter_inner.read().unwrap();
 
                 // Spawn a stream to process future messages from this client
-                let f = stream.for_each(move |msg| {
-                    process_message(c, &msg, entities.clone());
-                    Ok(())
-                }).map_err(|_| ());
+                let entities_inner = entities.clone();
+                let f = stream
+                    .map_err(|_| ())
+                    .for_each(move |msg| {
+                        process_message(c, &msg, entities.clone());
+                        Ok(())
+                    })
+                    .then(move |_| {
+                        connections_inner.write().unwrap().remove(&id);
+                        entities_inner.write().unwrap().remove(&id);
+                        Ok(())
+                    });
 
                 executor_2inner.spawn(f);
 
@@ -81,61 +101,34 @@ fn main() {
         .map_err(|_| ());
 
     // This stream is the game loop
-    let send_handler = future::loop_fn((), move |_| {
-        // This time we clone because "and_then" (line 94) takes a FnMut closure which
-        let connections_inner = connections.clone();
-        let executor          = executor.clone();
-        let entities_inner    = entities.clone();
+    let send_handler = tokio::timer::Interval::new(Instant::now(), Duration::from_millis(100))
+        .map_err(|_| ())
+        .for_each(move |_| {
+            let connections_inner = connections.clone();
+            let executor          = executor.clone();
+            let entities_inner    = entities.clone();
 
-        // Delay makes the loop run just 10 times a second
-        tokio::timer::Delay::new(Instant::now() + Duration::from_millis(100))
-            .map_err(|_| ())
-            .and_then(move |_| {
-                let mut conn = connections_inner.write().unwrap();
-                let ids = conn.iter().map(|(k,v)| { k.clone() }).collect::<Vec<_>>();
+            let entities = entities_inner.read().unwrap();
+            if let Some((_, first)) = entities.iter().take(1).next() {
+                // Meticulously serialize entity vector into json
+                let serial_entities = format!("[{}]", entities.iter().skip(1)
+                                              .map(|(_,e)| e.to_json())
+                                              .fold(first.to_json(), |acc,s| format!("{},{}",s,acc)));
 
-                for id in ids.iter() {
-                    // Must take ownership of the sink to send on it
-                    // The only way to take ownership of a hashmap value is to remove it
-                    // And later put it back (line 124)
-                    let sink = conn.remove(id).unwrap();
-
-                    /* Meticulously serialize entity vector into json */
-                    let entities = entities_inner.read().unwrap();
-                    let first = match entities.iter().take(1).next() {
-                        Some((_,e)) => e,
-                        None => return Ok(Loop::Continue(())),
-                    };
-                    let serial_entities = format!("[{}]", entities.iter().skip(1)
-                                                  .map(|(_,e)| e.to_json())
-                                                  .fold(first.to_json(), |acc,s| format!("{},{}",s,acc)));
-                    /**/
-
-                    // Clone for future "f"
-                    let connections = connections_inner.clone();
-                    let id = id.clone();
-
+                let connections = connections_inner.read().unwrap();
+                for sink in connections.values().cloned() {
                     // This is where the game state is actually sent to the client
                     let f = sink
-                        .send(OwnedMessage::Text(serial_entities))
-                        .and_then(move |sink| {
-                            // Re-insert the entry to the connections map
-                            connections.write().unwrap().insert( id.clone(), sink );
-                            Ok(())
-                        })
+                        .send(OwnedMessage::Text(serial_entities.clone()))
+                        .map(|_| ())
                         .map_err(|_| ());
 
                     executor.spawn(f);
-                }
+                };
+            }
 
-                // Damn type inference...
-                // This would just return "Continue" if it could for an infinite loop
-                match true {
-                    true => Ok(Loop::Continue(())),
-                    false => Ok(Loop::Break(())),
-                }
-            })
-    });
+            Ok(())
+        });
 
     // Finally, block the main thread to wait for the connection_handler and send_handler streams
     // to finish. Which they never should unless there is an error
